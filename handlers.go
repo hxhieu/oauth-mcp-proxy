@@ -655,6 +655,21 @@ func (h *OAuth2Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 		// Use request-scoped context with timeout to prevent DoS from slow IdP
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+
+		// Inject scope into the outgoing refresh request. Entra ID (Azure AD)
+		// returns AADSTS90009 when an app refreshes a token for itself without
+		// specifying the resource via scope. Go's oauth2.TokenSource omits
+		// scopes on refresh by design, so we use a custom transport (same
+		// pattern as pkceTransport above) to inject them.
+		scope := strings.Join(h.oauth2Config.Scopes, " ")
+		customClient := &http.Client{
+			Transport: &refreshScopeTransport{
+				base:  http.DefaultTransport,
+				scope: scope,
+			},
+		}
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, customClient)
+
 		src := h.oauth2Config.TokenSource(ctx, &oauth2.Token{
 			RefreshToken: refreshToken,
 		})
@@ -776,6 +791,45 @@ func (p *pkceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return p.base.RoundTrip(req)
+}
+
+// refreshScopeTransport injects the scope parameter into outgoing refresh
+// token requests. Entra ID (Azure AD) requires scope on refresh when an app
+// requests a token for itself (AADSTS90009). Go's oauth2 stdlib omits scopes
+// from refresh requests by design, so this transport adds them back.
+type refreshScopeTransport struct {
+	base  http.RoundTripper
+	scope string
+}
+
+// RoundTrip implements the RoundTripper interface
+func (t *refreshScopeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == "POST" && strings.Contains(req.URL.Path, "/token") {
+		defer func() {
+			if closeErr := req.Body.Close(); closeErr != nil {
+				log.Printf("Warning: failed to close request body: %v", closeErr)
+			}
+		}()
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+
+		if values.Get("scope") == "" && t.scope != "" {
+			values.Set("scope", t.scope)
+		}
+
+		encoded := values.Encode()
+		req.Body = io.NopCloser(strings.NewReader(encoded))
+		req.ContentLength = int64(len(encoded))
+	}
+
+	return t.base.RoundTrip(req)
 }
 
 // getEnv gets environment variable with default value
